@@ -70,13 +70,6 @@ void genIV(uint8_t* iv, size_t length = 16){
 // BUSY pin:  9
 SX1262 radio = new Module(41, 39, 42, 40);
 
-// or detect the pinout automatically using RadioBoards
-// https://github.com/radiolib-org/RadioBoards
-/*
-#define RADIO_BOARD_AUTO
-#include <RadioBoards.h>
-Radio radio = new RadioModule();
-*/
 
 // save transmission states between loops
 int transmissionState = RADIOLIB_ERR_NONE;
