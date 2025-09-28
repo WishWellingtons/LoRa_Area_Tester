@@ -1,0 +1,319 @@
+/*
+  Made to test an area of interest's connectivity with a static receiving node.
+  This code is for the *MOBILE NODE* - the device that will move around.
+  
+  Used the very helpful RadioLib library, this is based around the Ping-Pong example. Details can be seen below:
+  For default module settings, see the wiki page
+  https://github.com/jgromes/RadioLib/wiki/Default-configuration#sx126x---lora-modem
+
+  For full API reference, see the GitHub Pages
+  https://jgromes.github.io/RadioLib/
+*/
+
+// include the libraries
+#include <RadioLib.h>
+#include <TinyGPSPlus.h>
+#include <SPI.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <AESLib.h>
+
+
+//gps 
+static const int RX_pin = 1 , TX_pin = 2;
+static const uint32_t GPSBaud = 115200;
+TinyGPSPlus gps;
+HardwareSerial GPS(1);
+
+
+//button
+#define button 4
+
+//packet structures
+#pragma pack(push, 1)
+struct Payload {
+  uint8_t id;
+  int32_t lat;
+  int32_t lng;
+  uint16_t alt; 
+  uint8_t endFlag;
+  uint8_t padding[4];
+};
+#pragma pack(pop)
+
+
+//display
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define SCREEN_ADDRESS 0x3C
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+//encryption
+AESLib aesLib;
+const uint8_t aes_key[16] = {
+  //insert key here//
+};
+void genIV(uint8_t* iv, size_t length = 16){
+  for(size_t i=0; i<length; i++){
+    iv[i] = random(0,256);
+  }
+}
+
+
+
+// SX1262 has the following connections:
+// NSS pin:   10
+// DIO1 pin:  2
+// NRST pin:  3
+// BUSY pin:  9
+SX1262 radio = new Module(41, 39, 42, 40);
+
+// or detect the pinout automatically using RadioBoards
+// https://github.com/radiolib-org/RadioBoards
+/*
+#define RADIO_BOARD_AUTO
+#include <RadioBoards.h>
+Radio radio = new RadioModule();
+*/
+
+// save transmission states between loops
+int transmissionState = RADIOLIB_ERR_NONE;
+
+// flag to indicate transmission or reception state
+bool transmitFlag = false;
+
+//button
+volatile bool buttonPressed = false;
+volatile unsigned long lastInterruptTime = 0;
+
+void IRAM_ATTR checkButton(void){
+  unsigned long currentTime = millis();
+  if(currentTime - lastInterruptTime > 100){
+    buttonPressed = true;
+    lastInterruptTime = currentTime;
+  }
+}
+
+static void smartDelay(unsigned long ms)
+{
+  unsigned long start = millis();
+  do 
+  {
+    while (GPS.available())
+      gps.encode(GPS.read());
+  } while (millis() - start < ms);
+}
+
+void buttonTransmit(void){
+  static Payload p;
+  static uint8_t iv_key[16];
+  static uint8_t packet[48];
+  static uint8_t payloadBuffer[sizeof(Payload)];
+  p.id = 0x01;
+  p.endFlag = 0xFF;
+  memset(p.padding, 0, sizeof(p.padding));
+  
+  if(buttonPressed){
+    smartDelay(1000);
+    Serial.print(F("[SX1262] Sending another packet ... "));
+    unsigned long start = millis();
+    if(!GPS.available()){
+      Serial.print(F("NO GPS!"));
+    }
+    Serial.print("Satellites: ");
+    Serial.println(gps.satellites.value());
+    p.lat = static_cast<int32_t>(gps.location.lat() * 1e6);
+    p.lng = static_cast<int32_t>(gps.location.lng() * 1e6);
+    Serial.println(F("Lat: "));
+    Serial.println(p.lat);
+    Serial.println(F("Lng: "));
+    Serial.println(p.lng);
+    if(gps.altitude.isValid() && gps.location.age() < 2000){
+      p.alt = static_cast<uint16_t>(gps.altitude.meters() * 100);
+    }
+    else{
+      p.alt = 0xFFFF;
+    }
+  }
+  memcpy(payloadBuffer, &p, sizeof(p));
+  genIV(iv_key);
+  memcpy(packet, iv_key, 16);
+  aesLib.set_paddingmode((paddingMode)0);
+  int encLen = aesLib.encrypt(payloadBuffer, 16, packet+16, aes_key, 128, iv_key);
+  uint8_t decrypted[32];
+  int decLen = aesLib.decrypt(packet+16, encLen, decrypted, aes_key, 128, iv_key);
+  Serial.println(encLen);
+  Serial.println(decLen);
+  Serial.print("Decrypted: ");
+  for(int i = 0; i< sizeof(decrypted); i++){
+    Serial.printf("%02X ", decrypted[i]);
+  }
+  Serial.println();
+  /*if(encLen <= 0 || encLen > 32){
+    Serial.println(F("Encryption failed or overflow!"));
+    Serial.println(encLen);
+    Serial.println(sizeof(Payload));
+    return;
+  }*/
+  //String payload = "<" + String(p.lat, 6) + "," + String(p.lng, 6) + "," + String(p.alt, 2) + ">";
+  transmissionState = radio.startTransmit(packet, 32);
+  updateLocationDisplay((float)p.lat/1e6, (float)p.lng/1e6, (float)p.alt/100.0f);
+  transmitFlag = true;
+  buttonPressed = false;
+}
+
+
+
+void updateLocationDisplay(float lat, float lng, float alt){
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.print("Lat: ");
+  display.println(lat, 6);
+  display.print("Lng: ");
+  display.println(lng, 6);
+  display.print("Alt: ");
+  display.println(alt, 6);
+  display.display();
+}
+
+void updateSignalDisplay(String confirm, float RSSI, float SNR){
+  display.setCursor(0, 32);
+  display.println("Location logged!");
+  display.print("RSSI: ");
+  display.println(RSSI);
+  display.print("SNR: ");
+  display.println(SNR);
+  display.display();
+}
+// flag to indicate that a packet was sent or received
+volatile bool operationDone = false;
+
+// this function is called when a complete packet
+// is transmitted or received by the module
+// IMPORTANT: this function MUST be 'void' type
+//            and MUST NOT have any arguments!
+
+void IRAM_ATTR setFlag(void) {
+  // we sent or received a packet, set the flag
+  operationDone = true;
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  //display setup
+  display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS);
+  delay(2000);
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0, 0);
+  display.println("ON!");
+  display.display();
+  //gps setup
+  GPS.begin(GPSBaud, SERIAL_8N1, RX_pin, TX_pin);
+  //button setup
+  pinMode(button, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(button), checkButton, FALLING);
+  //aes setup
+  aesLib.set_paddingmode((paddingMode)0);//padding is manual - only works for 16 bytes!!
+  // initialize SX1262 with default settings
+  Serial.print(F("[SX1262] Initializing ... "));
+  int state = radio.begin(868.0);
+  if (state == RADIOLIB_ERR_NONE) {
+    Serial.println(F("success!"));
+  } else {
+    Serial.print(F("failed, code "));
+    Serial.println(state);
+    while (true) { delay(10); }
+  }
+
+  // set the function that will be called
+  // when new packet is received
+  radio.setDio1Action(setFlag);
+
+  #if defined(INITIATING_NODE)
+    // send the first packet on this node
+    Serial.print(F("[SX1262] Sending first packet ... "));
+    transmissionState = radio.startTransmit("Hello World!");
+    transmitFlag = true;
+  #else
+    // start listening for LoRa packets on this node
+    Serial.print(F("[SX1262] Starting to listen ... "));
+    state = radio.startReceive();
+    if (state == RADIOLIB_ERR_NONE) {
+      Serial.println(F("success!"));
+    } else {
+      Serial.print(F("failed, code "));
+      Serial.println(state);
+      while (true) { delay(10); }
+    }
+  #endif
+}
+
+void loop() {
+  // check if the previous operation finished
+  if(operationDone) {
+    // reset flag
+    operationDone = false;
+
+    if(transmitFlag) {
+      // the previous operation was transmission, listen for response
+      // print the result
+      if (transmissionState == RADIOLIB_ERR_NONE) {
+        // packet was successfully sent
+        Serial.println(F("transmission finished!"));
+
+      } else {
+        Serial.print(F("failed, code "));
+        Serial.println(transmissionState);
+
+      }
+
+      // listen for response
+      radio.startReceive();
+      transmitFlag = false;
+
+    } else {
+      // the previous operation was reception
+      // print data and send another packet
+      String str;
+      int state = radio.readData(str);
+
+      if (state == RADIOLIB_ERR_NONE) {
+        // packet was successfully received
+        Serial.println(F("[SX1262] Received packet!"));
+
+        // print data of the packet
+        Serial.print(F("[SX1262] Data:\t\t"));
+        Serial.println(str);
+
+        // print RSSI (Received Signal Strength Indicator)
+        Serial.print(F("[SX1262] RSSI:\t\t"));
+        float RSSI = radio.getRSSI();
+        Serial.print(RSSI);
+        Serial.println(F(" dBm"));
+
+        // print SNR (Signal-to-Noise Ratio)
+        Serial.print(F("[SX1262] SNR:\t\t"));
+        float SNR = radio.getSNR();
+        Serial.print(SNR);
+        Serial.println(F(" dB"));
+
+        updateSignalDisplay(str, RSSI, SNR);
+
+      }
+
+      // wait a second before transmitting again
+      while(!buttonPressed);
+      buttonTransmit();
+
+    }
+  
+  }
+  if(buttonPressed){
+    buttonTransmit();
+  }
+}
